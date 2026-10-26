@@ -2,17 +2,19 @@ import crypto from 'node:crypto';
 import cors from 'cors';
 import express from 'express';
 import multer from 'multer';
+import { Firestore } from '@google-cloud/firestore';
 import { Storage } from '@google-cloud/storage';
+import { CLIP_LIMITS, LimitError, isDeviceId, releaseUploads, reserveUploads } from './devices.js';
 
 const PORT = process.env.PORT || 3000;
 const BUCKET = process.env.GCS_BUCKET;
 const PREFIX = 'clips/';
 const MAX_BYTES = 2 * 1024 * 1024;
 
-// How many clips one submission may contain, per category. The category is
-// also the start of every object name, e.g. clips/chaos-1730000000000-<uuid>.webm
-const CATEGORY_LIMITS = { chaos: 5, peace: 1 };
-const MAX_FILES = Math.max(...Object.values(CATEGORY_LIMITS));
+// A device's whole allowance can arrive in one upload, so the per-device limits double
+// as per-request limits. The category also starts every object name, e.g.
+// clips/chaos-1730000000000-<uuid>.wav
+const MAX_FILES = Math.max(...Object.values(CLIP_LIMITS));
 
 // Frontend origins allowed to call the API, e.g. "https://sound-peace.onrender.com".
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
@@ -29,6 +31,8 @@ if (!BUCKET) {
 // locally, GOOGLE_APPLICATION_CREDENTIALS pointing at a key file, or the attached
 // service account when deployed on Cloud Run / GCE.
 const bucket = new Storage().bucket(BUCKET);
+// Per-device upload records (see devices.js). Same credentials and project as the bucket.
+const db = new Firestore({ databaseId: process.env.FIRESTORE_DATABASE_ID || '(default)' });
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_BYTES } });
 
 // Browsers report types like "audio/webm;codecs=opus", so we match on the base type.
@@ -60,8 +64,11 @@ app.get('/healthz', (req, res) => {
 
 app.post('/api/clips', upload.array('audio', MAX_FILES), async (req, res) => {
   const category = req.body?.category;
-  const limit = CATEGORY_LIMITS[category];
+  const limit = CLIP_LIMITS[category];
   if (!limit) return res.status(400).json({ error: 'category must be "chaos" or "peace"' });
+
+  const deviceId = req.body?.deviceId;
+  if (!isDeviceId(deviceId)) return res.status(400).json({ error: 'Missing or invalid deviceId' });
 
   const files = req.files ?? [];
   if (files.length === 0) return res.status(400).json({ error: 'Missing "audio" file field' });
@@ -76,18 +83,36 @@ app.post('/api/clips', upload.array('audio', MAX_FILES), async (req, res) => {
     return res.status(415).json({ error: `Unsupported type: ${files[badIndex].mimetype}` });
   }
 
-  const ids = await Promise.all(
-    files.map(async (file, i) => {
-      const id = `${category}-${Date.now()}-${crypto.randomUUID()}.${extensions[i]}`;
-      await bucket.file(PREFIX + id).save(file.buffer, {
-        contentType: file.mimetype,
-        resumable: false,
-      });
-      return id;
-    }),
-  );
+  // Count the clips against the device's allowance before storing them, and give the
+  // allowance back if storing fails.
+  let record;
+  try {
+    record = await reserveUploads(db, deviceId, category, files.length);
+  } catch (err) {
+    if (err instanceof LimitError) return res.status(409).json({ error: err.message, record: err.record });
+    throw err;
+  }
 
-  res.status(201).json({ ids });
+  let ids;
+  try {
+    ids = await Promise.all(
+      files.map(async (file, i) => {
+        const id = `${category}-${Date.now()}-${crypto.randomUUID()}.${extensions[i]}`;
+        await bucket.file(PREFIX + id).save(file.buffer, {
+          contentType: file.mimetype,
+          resumable: false,
+        });
+        return id;
+      }),
+    );
+  } catch (err) {
+    await releaseUploads(db, deviceId, category, files.length).catch((releaseErr) => {
+      console.error('Could not release reserved uploads', releaseErr);
+    });
+    throw err;
+  }
+
+  res.status(201).json({ ids, record });
 });
 
 app.use((err, req, res, next) => {
