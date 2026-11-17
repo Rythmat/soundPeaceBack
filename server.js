@@ -4,7 +4,7 @@ import express from 'express';
 import multer from 'multer';
 import { Firestore } from '@google-cloud/firestore';
 import { IdempotencyStrategy, Storage } from '@google-cloud/storage';
-import { CLIP_LIMITS, LimitError, checkAllowance, countUploads, isUuid, readDevice } from './devices.js';
+import { isRecorded, isUuid, recordUpload } from './uploads.js';
 
 const PORT = process.env.PORT || 3000;
 const BUCKET = process.env.GCS_BUCKET;
@@ -13,10 +13,10 @@ const PREFIX = 'clips/';
 // at 48 kHz, and still under this limit at 384 kHz.
 const MAX_BYTES = 4 * 1024 * 1024;
 
-// A device's whole allowance can arrive in one upload, so the per-device limits double
-// as per-request limits. The category also starts every object name, e.g.
-// clips/chaos-1730000000000-<uuid>.wav
-const MAX_FILES = Math.max(...Object.values(CLIP_LIMITS));
+// How many clips one upload may carry: as many as one visit to that page can record.
+// The category also starts every object name, e.g. clips/chaos-1730000000000-<uuid>.wav
+const MAX_CLIPS = { chaos: 5, peace: 1 };
+const MAX_FILES = Math.max(...Object.values(MAX_CLIPS));
 
 // Frontend origins allowed to call the API, e.g. "https://sound-peace.onrender.com".
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
@@ -37,7 +37,7 @@ if (!BUCKET) {
 const bucket = new Storage({
   retryOptions: { idempotencyStrategy: IdempotencyStrategy.RetryAlways },
 }).bucket(BUCKET);
-// Per-device upload records (see devices.js). Same credentials and project as the bucket.
+// Records of stored uploads (see uploads.js). Same credentials and project as the bucket.
 const db = new Firestore({ databaseId: process.env.FIRESTORE_DATABASE_ID || '(default)' });
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_BYTES } });
 
@@ -96,11 +96,8 @@ app.get('/healthz', (req, res) => {
 
 app.post('/api/clips', upload.array('audio', MAX_FILES), async (req, res) => {
   const category = req.body?.category;
-  const limit = CLIP_LIMITS[category];
+  const limit = MAX_CLIPS[category];
   if (!limit) return res.status(400).json({ error: 'category must be "chaos" or "peace"' });
-
-  const deviceId = req.body?.deviceId;
-  if (!isUuid(deviceId)) return res.status(400).json({ error: 'Missing or invalid deviceId' });
 
   // The browser sends the same upload ID each time it retries the same clips. Pages from
   // before upload IDs don't send one, so each of their requests counts as a new upload.
@@ -121,52 +118,35 @@ app.post('/api/clips', upload.array('audio', MAX_FILES), async (req, res) => {
     return res.status(415).json({ error: `Unsupported type: ${files[badIndex].mimetype}` });
   }
 
-  // Answer a retry of an upload that already went through (its response never reached
-  // the browser) without storing it again, and turn away uploads over the limit before
-  // storing anything.
-  const device = await readDevice(db, deviceId);
-  if (device.uploads[uploadId]) return res.json({ ids: [], record: device.record });
-  try {
-    checkAllowance(device.record, category, files.length);
-  } catch (err) {
-    if (err instanceof LimitError) return res.status(409).json({ error: err.message, record: err.record });
-    throw err;
-  }
+  // A retry of an upload that already went through (its response never reached the
+  // browser) is answered without storing the clips again.
+  if (await isRecorded(db, uploadId)) return res.json({ ids: [] });
 
-  // Store first, count second. If this process dies in between, the clips are stored but
-  // not counted, and the participant's retry stores them again: a spare copy. The other
-  // order could count clips that were never stored, and a retry would be told they were.
+  // Store first, record second. If this process dies in between, the clips are stored
+  // but not recorded, and the participant's retry stores them again: a spare copy. The
+  // other order could record clips that were never stored, and a retry would be told
+  // they had been.
   const names = files.map(
     (file, i) => `${PREFIX}${category}-${Date.now()}-${crypto.randomUUID()}.${extensions[i]}`,
   );
   const stored = await Promise.allSettled(files.map((file, i) => store(names[i], file)));
   const failure = stored.find((result) => result.status === 'rejected');
   if (failure) {
-    // Nothing is counted and the participant will retry the whole batch, so don't leave
+    // Nothing is recorded and the participant will retry the whole batch, so don't leave
     // part of it behind.
     await discard(names.filter((name, i) => stored[i].status === 'fulfilled'));
     throw failure.reason;
   }
 
-  let result;
-  try {
-    result = await countUploads(db, { deviceId, category, count: files.length, uploadId, requestId });
-  } catch (err) {
-    // A refusal means nothing was counted, so the clips go. Any other error might have
-    // come after the count was committed, so the clips stay.
-    if (err instanceof LimitError) {
-      await discard(names);
-      return res.status(409).json({ error: err.message, record: err.record });
-    }
-    throw err;
-  }
-  if (!result.counted) {
+  // If recording fails, the error might have come after the record was committed, so
+  // the clips stay.
+  if (!(await recordUpload(db, uploadId, requestId))) {
     // Another request for this upload got there first, and its clips are stored.
     await discard(names);
-    return res.json({ ids: [], record: result.record });
+    return res.json({ ids: [] });
   }
 
-  res.status(201).json({ ids: names.map((name) => name.slice(PREFIX.length)), record: result.record });
+  res.status(201).json({ ids: names.map((name) => name.slice(PREFIX.length)) });
 });
 
 app.use((err, req, res, next) => {
@@ -192,8 +172,8 @@ async function checkAccess() {
         'from failed or repeated uploads will be left there.',
     );
   }
-  // Not a valid device ID, so it can't be a real device's record.
-  await db.collection('devices').doc('startup-check').get();
+  // Not a valid upload ID, so it can't be a real upload's record.
+  await db.collection('uploads').doc('startup-check').get();
 }
 
 try {
